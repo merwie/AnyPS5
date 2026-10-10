@@ -6,7 +6,8 @@ import sys
 import tempfile
 
 from test_guest_intel_trampolines import main_fixture, pe_sections
-from test_guest_module_directories import module_with_symbol
+from test_guest_module_directories import module_with_symbol, needed_libraries
+from test_guest_needed_modules import executable_with_needed
 
 
 def pe_export_names(data):
@@ -38,10 +39,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="anyps5-module-dir-") as directory:
         work = Path(directory)
 
-        def convert(case, windows, options):
+        def convert(case, windows, options, executable=None):
             (case / "sce_module").mkdir(parents=True, exist_ok=True)
             source = case / "input.elf"
-            source.write_bytes(main_fixture())
+            source.write_bytes(main_fixture() if executable is None else executable)
             output = case / ("output.exe" if windows else "output.elf")
             result = subprocess.run([str(relinker), *(["--windows"] if windows else []), *options, str(source), str(output)],
                                     capture_output=True, text=True, timeout=30)
@@ -65,6 +66,8 @@ def main():
             if windows and os.name == "nt":
                 run = subprocess.run([str(output)], capture_output=True, text=True, timeout=30)
                 assert run.returncode == 42, (run.returncode, run.stdout, run.stderr)
+            if not windows:
+                assert not any("Plugins" in name for name in needed_libraries(output.read_bytes())), needed_libraries(output.read_bytes())
             if windows:
                 assert "__aps5_guest_initialize" in pe_export_names(artifact.read_bytes())
                 (case / "sce_module" / "bundled.prx").write_bytes(module_with_symbol(True))
@@ -76,8 +79,21 @@ def main():
                 assert "__aps5_guest_initialize" in pe_export_names(artifact.read_bytes())
                 (case / "sce_module" / "bundled.prx").unlink()
 
-            for rejected, message in ((str(plugins), "inside the input directory"),
-                                      ("../outside", "inside the input directory"),
+            case = work / f"{windows}-needed"
+            modules = case / "Media" / "Modules"
+            modules.mkdir(parents=True)
+            (modules / "needed.prx").write_bytes(module_with_symbol(True))
+            result, output = convert(case, windows, ["--module-dir", "Media/Modules"], executable_with_needed())
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            needed = case / "app0" / "Media" / "Modules" / "needed.prx.guest.prx"
+            if windows:
+                assert "__aps5_guest_initialize" not in pe_export_names(needed.read_bytes())
+            else:
+                assert "$ORIGIN/app0/Media/Modules/needed.prx.guest.prx" in needed_libraries(output.read_bytes()), needed_libraries(output.read_bytes())
+
+            case = work / f"{windows}-plugins"
+            for rejected, message in ((str(plugins), "inside the guest module parent directory"),
+                                      ("../outside", "inside the guest module parent directory"),
                                       ("Media/Missing", "not a directory"),
                                       ("sce_module", "Duplicate guest module directory")):
                 result, output = convert(case, windows, ["--module-dir", rejected])
